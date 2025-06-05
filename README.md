@@ -1,0 +1,598 @@
+# Combined ESP32 MQTT Receiver & Analyzer/Training Pipeline
+
+**Author:** Ardil Turhan
+**Last Updated:** 2025-06-05
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Repository Structure](#repository-structure)
+3. [Prerequisites](#prerequisites)
+4. [Receiver\_MQTT (ESP32) Guide](#receiver_mqtt-esp32-guide)
+
+   * [1. Folder Structure](#1-folder-structure)
+   * [2. Configuration](#2-configuration)
+   * [3. Build & Flash](#3-build--flash)
+   * [4. OTA (Python) Script](#4-ota-python-script)
+5. [Analyzer\_Training (Python) Guide](#analyzer_training-python-guide)
+
+   * [1. Folder Structure](#1-folder-structure-1)
+   * [2. Configuration & Data Requirements](#2-configuration--data-requirements)
+   * [3. Python Dependencies](#3-python-dependencies)
+   * [4. Synthetic Data Generation](#4-synthetic-data-generation)
+   * [5. Data Processing & Feature Engineering](#5-data-processing--feature-engineering)
+   * [6. Model Pre-training & Conversion](#6-model-pre-training--conversion)
+   * [7. MQTT-Based Conversion Script](#7-mqtt-based-conversion-script)
+6. [Putting It All Together](#putting-it-all-together)
+7. [Potential Enhancements](#potential-enhancements)
+8. [License](#license)
+
+---
+
+## Project Overview
+
+This repository contains two distinct but related subprojects:
+
+1. **Receiver\_MQTT (ESP32)**
+
+   * A FreeRTOS–based firmware that connects to Wi-Fi, subscribes to MQTT topics, and toggles LEDs (or processes incoming data) on an ESP32.
+   * Includes an optional OTA helper script (`ota.py`) that publishes firmware binaries over MQTT for remote firmware upgrades.
+
+2. **Analyzer\_Training (Python)**
+
+   * A local Python pipeline for generating synthetic time-series data (voltage/current/frequency), labeling anomalies, and training a Random Forest classifier (via TensorFlow Decision Forests).
+   * Data processing scripts to filter raw CSV data coming from MQTT, compute THD, and prepare features.
+   * Tools to convert the trained `joblib` model into a TensorFlow Lite (`.tflite`) artifact.
+
+---
+
+## Repository Structure
+
+```
+<project_root>/
+├─ receiver_mqtt/                 # **ESP32 FreeRTOS + MQTT receiver**
+│   ├─ build/                     # (ignored by Git) ESP-IDF build output
+│   ├─ main/
+│   │   ├─ CMakeLists.txt         # ESP-IDF CMake for application code
+│   │   └─ receiver_mqtt.c        # Main MQTT + Wi-Fi logic for LED control
+│   │
+│   ├─ CMakeLists.txt             # Top-level CMakeLists for ESP-IDF
+│   ├─ partitions.csv             # (Optional) partition config for ESP32
+│   ├─ sdkconfig                  # ESP-IDF project configuration (Wi-Fi/SDK options)
+│   ├─ sdkconfig.old              # Backup (ignored by `.gitignore`)
+│   └─ ota.py                     # Python script to publish firmware via MQTT
+│
+├─ analyzer_training/             # **Python–based data generation & model training**
+│   ├─ tfidf_random_forest_model/ # Trained TF-SavedModel + supporting files
+│   │   ├─ assets/                # (ignored by Git if large; optional)
+│   │   ├─ variables/             # (ignored by Git if large; optional)
+│   │   ├─ fingerprint.pb         # Model fingerprint metadata (ignored by default)
+│   │   ├─ keras_metadata.pb       # Keras metadata (ignored by default)
+│   │   └─ saved_model.pb         # Final TF SavedModel (tracked in Git)
+│   │
+│   ├─ data_processing.py         # Convert raw CSV → features & compute THD, thresholds
+│   ├─ model_pre_trainer.py       # Train TF-Decision Forests model on processed data
+│   ├─ synthetic_data_generator.py# Generate synthetic time-series data with anomalies
+│   ├─ model_converter.py         # Wrap trained RF in tf.Module → export to TFLite
+│   ├─ mqtt_conversion.py         # Publish firmware or data over MQTT (helper script)
+│   └─ test.c                     # (Optional C test file; ignored if not used)
+│
+├─ .gitignore
+└─ README.md
+```
+
+---
+
+## Prerequisites
+
+1. **ESP32 Toolchain & ESP-IDF**
+
+   * Install [Espressif ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) (v5.xx or above).
+   * Make sure `idf.py` (CMake wrapper) is on your PATH.
+   * You must have a serial driver installed (e.g., USB-to-UART) so you can flash and monitor output.
+
+2. **Python 3.8+**
+
+   * For the *analyzer\_training* folder, you need Python 3.8 or above.
+   * We recommend using a virtual environment (`venv` or `conda`).
+
+3. **System Dependencies**
+
+   * On Linux/macOS, you may need `git`, `cmake`, `ninja`, plus basic build-essentials (`gcc`, `make`), and Python dev headers (`python3-dev`).
+
+4. **MQTT Broker**
+
+   * You’ll need access to a running MQTT broker (e.g. Eclipse Mosquitto, HiveMQ, or a cloud MQTT service).
+   * For local testing, you can run `mosquitto` on your machine or use a publicly hosted broker (note: in production, always secure with TLS/username/password).
+
+---
+
+## Receiver\_MQTT (ESP32) Guide
+
+### 1. Folder Structure
+
+```
+receiver_mqtt/
+├─ build/                    # (auto-generated by ESP-IDF; not tracked)
+├─ main/
+│   ├─ CMakeLists.txt        # App-level CMake lists (points to receiver_mqtt.c)
+│   └─ receiver_mqtt.c       # Contains Wi-Fi + MQTT + LED control logic
+│
+├─ CMakeLists.txt            # Top-level CMake (links IDF components)
+├─ partitions.csv            # Partition table CSV
+├─ sdkconfig                 # ESP-IDF config (Wi-Fi settings, flash options)
+├─ sdkconfig.old             # Backup config (ignored by Git)
+└─ ota.py                    # Python script to publish firmware via MQTT
+```
+
+### 2. Configuration
+
+1. **Wi-Fi Credentials**
+   Open `receiver_mqtt/main/receiver_mqtt.c` and find:
+
+   ```c
+   static const char *WIFI_SSID = "<YOUR_WIFI_SSID>";
+   static const char *WIFI_PASS = "<YOUR_WIFI_PASSWORD>";
+   ```
+
+   Replace the placeholders with your Wi-Fi SSID and password.
+
+2. **MQTT Broker & Topic**
+   In the same file (`receiver_mqtt.c`), find:
+
+   ```c
+   static const char *MQTT_BROKER_URI = "<YOUR_MQTT_BROKER_URI>";
+   static const char *MQTT_TOPIC      = "<YOUR_MQTT_TOPIC>";
+   ```
+
+   Replace `<YOUR_MQTT_BROKER_URI>` (e.g., `"mqtt://test.mosquitto.org:1883"`) and `<YOUR_MQTT_TOPIC>` (e.g., `"esp/device1/data"`).
+
+3. **SDK Configuration**
+
+   * If you need to fine-tune any flash settings or pin assignments, you can run:
+
+     ```bash
+     idf.py menuconfig
+     ```
+   * This edits `receiver_mqtt/sdkconfig`. Once saved, commit only the final `sdkconfig`; you can ignore `sdkconfig.old`.
+
+### 3. Build & Flash
+
+1. **Fetch ESP-IDF environment** (example for Linux/macOS):
+
+   ```bash
+   cd receiver_mqtt
+   source $HOME/esp/esp-idf/export.sh
+   ```
+
+2. **Configure (optional)**
+   If you want to tweak partition sizes or other defaults:
+
+   ```bash
+   idf.py menuconfig
+   ```
+
+   Otherwise, the default `sdkconfig` should already set up Wi-Fi, logging levels, and default flash parameters.
+
+3. **Build the firmware**
+
+   ```bash
+   idf.py build
+   ```
+
+   * This generates everything under `receiver_mqtt/build/`, including `receiver_mqtt.elf` and `receiver_mqtt.bin`.
+
+4. **Flash to your device** (replace `/dev/ttyUSB0` with your actual serial port):
+
+   ```bash
+   idf.py -p /dev/ttyUSB0 flash monitor
+   ```
+
+   * After flashing, the ESP32 will reboot automatically and connect to Wi-Fi + MQTT.
+   * You can open the serial monitor via `idf.py monitor`.
+   * To exit the monitor, press `Ctrl+]`.
+
+5. **Clean** (if you want to force a full rebuild):
+
+   ```bash
+   idf.py fullclean
+   ```
+
+### 4. OTA (Python) Script
+
+The `ota.py` script (in `receiver_mqtt/`) publishes your built firmware over MQTT so that a remote device can pick it up and flash it. By default, it looks for:
+
+```python
+FIRMWARE_PATH = "<PATH_TO_YOUR_RECEIVER_MQTT_BUILD>/receiver_mqtt.bin"
+MQTT_BROKER    = "<YOUR_MQTT_BROKER_IP_OR_HOSTNAME>"
+MQTT_PORT      = 1884
+MQTT_TOPIC_OTA = "<YOUR_MQTT_OTA_TOPIC>"
+```
+
+1. **Edit `ota.py`**
+   Replace:
+
+   ```python
+   MQTT_BROKER    = "<YOUR_MQTT_BROKER_ADDRESS>"
+   MQTT_PORT      = 1884
+   MQTT_TOPIC_OTA = "<YOUR_MQTT_OTA_TOPIC>"
+   FIRMWARE_PATH  = "<PATH_TO_YOUR_FIRMWARE_FILE>"
+   ```
+
+   For example:
+
+   ```python
+   MQTT_BROKER    = "test.mosquitto.org"
+   MQTT_PORT      = 1883
+   MQTT_TOPIC_OTA = "esp/device1/ota"
+   FIRMWARE_PATH  = "build/receiver_mqtt.bin"
+   ```
+
+2. **Install dependencies**
+
+   ```bash
+   pip install paho-mqtt
+   ```
+
+3. **Run the script**
+
+   ```bash
+   python3 ota.py
+   ```
+
+   * It will read the binary in 1 KB chunks and publish each packet to `MQTT_TOPIC_OTA`.
+   * Your ESP32 firmware must be listening on that topic (implement the corresponding “OTA receiver” logic in C if desired).
+
+---
+
+## Analyzer\_Training (Python) Guide
+
+This folder contains everything you need to generate synthetic data, process real/synthetic data, train a Random Forest classifier using TensorFlow Decision Forests, and convert the final model to TFLite.
+
+### 1. Folder Structure
+
+```
+analyzer_training/
+├─ tfidf_random_forest_model/        # Final TensorFlow “SavedModel” (tracked)
+/   ├─ saved_model.pb                # (This is the only file we track in Git under this directory)
+/   ├─ variables/                    # (ignored in Git, but used at runtime)
+/   ├─ assets/                       # (ignored in Git, usually empty)
+/   ├─ fingerprint.pb                # (ignored by .gitignore)
+/   └─ keras_metadata.pb              # (ignored by .gitignore)
+│
+├─ data_processing.py                # Load raw CSV, compute THD, apply thresholds, merge features
+├─ model_pre_trainer.py              # Train TF-Decision Forests RF on processed data & evaluate
+├─ synthetic_data_generator.py       # Create realistic synthetic voltage/current/frequency time series
+├─ model_converter.py                # Wrap joblib RF → tf.Module → export a .tflite model
+├─ mqtt_conversion.py                # Publish firmware or data over MQTT (helper script)
+└─ test.c                            # (Optional C test file; not strictly needed for Python pipeline)
+```
+
+### 2. Configuration & Data Requirements
+
+* **CSV Input**
+
+  * The pipeline expects one or more raw CSVs containing Modbus telemetry, for example:
+
+    ```
+    mqtt_all_messages_<timestamp>.csv
+    mqtt_messages_1006_<timestamp>.csv
+    mqtt_register_counts_<timestamp>.csv
+    ```
+  * If you have live data from MQTT, first use `mqtt_conversion.py` or another subscriber to save it into a CSV with columns like:
+
+    ```
+    "Start register", "Raw data"
+    ```
+  * Then run `data_processing.py` to filter out specific registers (1006, 1007, etc.), compute THD, create binary labels, and merge features.
+
+* **Synthetic Data**
+
+  * To generate synthetic data instead of relying on real CSVs, run:
+
+    ```bash
+    python3 synthetic_data_generator.py
+    ```
+  * Output:
+
+    ```
+    synthetic_mpr53s_data_with_realistic_failures.csv
+    ```
+  * This CSV includes fields:
+
+    ```
+    Time, Voltage_L1 (JSON array), Current_L1, Active_Power_L1, THD_Voltage_L1, Frequency, target
+    ```
+  * The `target` column is 0/1 (clean vs. anomaly).
+
+* **Directory for processed data**
+
+  * `data_processing.py` reads either a real or synthetic CSV, creates a DataFrame of features, then writes:
+
+    ```
+    processed_mqtt_data.csv
+    ```
+  * You can then point `model_pre_trainer.py` at `processed_mqtt_data.csv` for training.
+
+### 3. Python Dependencies
+
+Create and activate a virtual environment, for example:
+
+```bash
+cd analyzer_training
+python3 -m venv venv
+source venv/bin/activate    # Linux/macOS
+# or
+# venv\Scripts\activate.bat # Windows
+```
+
+Install required packages:
+
+```bash
+pip install --upgrade pip
+
+# Core data libraries
+pip install numpy pandas scipy scikit-learn
+
+# TensorFlow & Decision Forests
+pip install tensorflow tensorflow-decision-forests
+
+# MQTT (if you plan to use mqtt_conversion.py)
+pip install paho-mqtt
+
+# Joblib (for model loading/saving)
+pip install joblib
+```
+
+You can also generate a `requirements.txt` by running:
+
+```bash
+pip freeze > requirements.txt
+```
+
+### 4. Synthetic Data Generation
+
+1. **Edit (optional)**
+
+   * If you want to adjust the number of samples or anomaly ratio, open `synthetic_data_generator.py` and change:
+
+     ```python
+     num_samples = 1000            # number of time series
+     sampling_rate = 1000          # 1 kHz sampling
+     # etc.
+     ```
+
+2. **Run the script**
+
+   ```bash
+   python3 synthetic_data_generator.py
+   ```
+
+   * This writes a CSV named `synthetic_mpr53s_data_with_realistic_failures.csv` (timestamp can be appended).
+   * Each row contains:
+
+     ```
+     Time, Voltage_L1 (JSON string), Current_L1, Active_Power_L1, THD_Voltage_L1, Frequency, target
+     ```
+
+3. **Inspect the CSV**
+
+   * Make sure it looks reasonable:
+
+     ```
+     2024-01-01 00:00:00,"[0.23, 0.45, …]", 3.12, 705.6, 0.028, 50.12, 0
+     2024-01-01 00:01:00,"[…]", 2.87, 670.4, 0.034, 49.78, 1
+     …
+     ```
+
+### 5. Data Processing & Feature Engineering
+
+1. **Prepare raw CSV(s)**
+
+   * Either use your real MQTT data CSV(s) (e.g. downloaded via `mqtt_conversion.py`), or feed the synthetic CSV from step 4.
+
+2. **Adjust column names**
+
+   * By default, `data_processing.py` expects a column `"Start register"` and `"Raw data"`.
+   * If your CSV uses different column names, edit the `pd.read_csv(...)` parameters accordingly.
+
+3. **Run data processing**
+
+   ```bash
+   python3 data_processing.py
+   ```
+
+   * This will:
+
+     1. Filter out registers 1006 (current), 1007 (active power), 1009 (voltage), 1010 (frequency).
+     2. Convert the “Raw data” strings to numeric.
+     3. Compute THD for voltage.
+     4. Create binary flags for over/under-current and over/under-voltage.
+     5. Merge features into `processed_mqtt_data.csv`:
+
+        ```
+        Raw data_Current, Current_Issue, Raw data_Voltage, Voltage_Issue, Active_Power, Frequency
+        ```
+
+4. **Verify output**
+
+   * Open `processed_mqtt_data.csv` and ensure it has the columns:
+
+     ```
+     Raw data_Current, Current_Issue, Raw data_Voltage, Voltage_Issue, Active_Power, Frequency
+     ```
+
+### 6. Model Pre-training & Conversion
+
+1. **Train a Random Forest (TF-Decision Forests)**
+
+   * Open `model_pre_trainer.py` and verify that it points to your processed data:
+
+     ```python
+     data = pd.read_csv('processed_mqtt_data.csv', converters={'Voltage_L1': json.loads})
+     ```
+
+   * If you generated purely synthetic data in Step 4, either skip data\_processing and point it to your synthetic CSV, or combine them.
+
+   * Run:
+
+     ```bash
+     python3 model_pre_trainer.py
+     ```
+
+   * This script will:
+
+     1. Split data into train/test (80/20).
+     2. Convert to a `tf.data.Dataset` (batches).
+     3. Instantiate a `tfdf.keras.RandomForestModel(...)`.
+     4. Train for one or more epochs.
+     5. Print evaluation metrics (accuracy, precision, recall, F1, AUC-ROC, confusion matrix).
+     6. Save the resulting model to `tfidf_random_forest_model/saved_model.pb` (plus accompanying metadata in that folder).
+
+2. **Convert the model to TFLite**
+
+   * After training, open `model_converter.py`. By default, it loads:
+
+     ```python
+     rf_model = joblib.load('trained_model.joblib')
+     ```
+
+     and expects `trained_model.joblib` to exist. If your RF is saved differently, update the path.
+
+   * Next, generate a wrapper that implements:
+
+     ```python
+     class RandomForestWrapper(tf.Module):
+         @tf.function(input_signature=[tf.TensorSpec(shape=[None, 60004], dtype=tf.float32)])
+         def __call__(self, inputs):
+             …  # calls `self.model.predict_proba(inputs_np)`
+     ```
+
+   * Run:
+
+     ```bash
+     python3 model_converter.py
+     ```
+
+   * This will produce `model.tflite` in the current directory. You can drop this onto resource-constrained devices or run TFLite inference.
+
+3. **Inspect the files**
+
+   * In `tfidf_random_forest_model/` you should see:
+
+     ```
+     saved_model.pb
+     variables/           (ignored in Git, but used at runtime)
+     assets/              (ignored in Git, usually empty)
+     ```
+   * In the root (or in `analyzer_training/`), you’ll have `model.tflite`.
+
+### 7. MQTT-Based Conversion Script
+
+There is an additional helper in `mqtt_conversion.py` that publishes firmware chunks or arbitrary binary data over MQTT. Use it to stream:
+
+* The compiled firmware (`receiver_mqtt.bin`) for OTA.
+* Or to stream processed CSV data or TFLite binaries to another subscriber.
+
+Before running, edit the top of `mqtt_conversion.py`:
+
+```python
+MQTT_BROKER    = "<YOUR_MQTT_BROKER_ADDRESS>"
+MQTT_PORT      = 1884
+MQTT_TOPIC_OTA = "<YOUR_MQTT_OTA_TOPIC>"
+FIRMWARE_PATH  = "<PATH_TO_YOUR_FIRMWARE_FILE>"   # or other binary
+CHUNK_SIZE     = 1024
+```
+
+Then simply:
+
+```bash
+python3 mqtt_conversion.py
+```
+
+---
+
+## Putting It All Together
+
+1. **Flash the ESP32**
+
+   * Verify your placeholders in `receiver_mqtt.c` are set (Wi-Fi SSID, password, broker URI, topics).
+   * Build and flash via ESP-IDF.
+   * Open serial monitor to confirm successful Wi-Fi & MQTT connection.
+
+2. **Generate or Collect Data**
+
+   * Either generate purely synthetic data with `synthetic_data_generator.py`
+   * Or subscribe to real Telemetry with `mqtt_conversion.py` → produce raw CSV(s).
+
+3. **Process & Label**
+
+   * Run `data_processing.py` on either synthetic or real CSV.
+   * Inspect `processed_mqtt_data.csv`.
+
+4. **Train & Export Model**
+
+   * Run `model_pre_trainer.py` → `tfidf_random_forest_model/saved_model.pb`.
+   * Optionally convert to TFLite with `model_converter.py` → `model.tflite`.
+
+5. **(Optional) OTA Update**
+
+   * Compile new firmware → `receiver_mqtt.bin`.
+   * Use `ota.py` or `mqtt_conversion.py` to publish firmware chunks to the ESP32 over MQTT.
+
+---
+
+## Potential Enhancements
+
+* **Secure MQTT**
+
+  * Add TLS support (configure `esp_mqtt_client_config_t` with CA cert, client cert, etc.).
+  * Implement username/password (or token) authentication.
+
+* **Over-the-Air (OTA) Receiver on ESP32**
+
+  * The current C code only subscribes for normal data. Build a corresponding “OTA client” in C that listens to the OTA topic, reassembles binary chunks, verifies signature, and flashes new firmware.
+
+* **Dashboard / Visualization**
+
+  * Create a simple web dashboard (Node.js/Flask) that subscribes to MQTT telemetry and plots real-time voltage/current/THD.
+
+* **Model Quantization / Pruning**
+
+  * After exporting `model.tflite`, run post-training quantization or pruning to reduce footprint.
+
+* **Automated Retraining**
+
+  * Hook your Python pipeline into a daily cron job that fetches new CSVs from MQTT (via `mqtt_conversion.py`), reprocesses data, and performs incremental training.
+
+* **Unit Tests**
+
+  * Add `pytest` tests for each Python module (`data_processing.py`, `synthetic_data_generator.py`, etc.).
+  * Add C test cases in `test.c` (if needed) to verify JSON parsing logic or threshold logic.
+
+* **Documentation / Sphinx**
+
+  * Generate an HTML docs site with Sphinx for the Python code, adding docstrings & API reference.
+
+---
+
+## License
+
+This repository is released under the **MIT License**. See [LICENSE](LICENSE) for details. If you don’t already have a `LICENSE` file, you can create one with:
+
+```
+MIT License
+
+Copyright (c) YYYY Your Name
+
+Permission is hereby granted, free of charge, to any person obtaining a copy...
+(standard MIT text)
+```
+
+---
+
+### Questions / More Info
+
+If you want additional details—such as exact `sdkconfig` values, sample raw CSV formats, or details about how the C “OTA receiver” should be implemented—just let me know.

@@ -585,7 +585,7 @@ This repository is released under the **MIT License**. See [LICENSE](LICENSE) fo
 ```
 MIT License
 
-Copyright (c) YYYY Your Name
+Copyright (c) 2025 Ardil Turhan
 
 Permission is hereby granted, free of charge, to any person obtaining a copy...
 (standard MIT text)
